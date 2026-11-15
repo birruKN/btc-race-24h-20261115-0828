@@ -9,20 +9,25 @@
 // never holds through a slow drift — it is flat most of the time.
 //
 // Entry (on a bar's close, filled at the next bar's open):
-//   - first tranche: the 90-bar log return is at or below -1.5% -> buy 25% of equity
-//   - scale-in: while holding, if the 90-bar log return reaches -2.5% -> buy
-//     another 75% of equity (one scale-in per position)
+//   - first tranche: the 90-bar log return is at or below -1.5% -> buy 40% of equity
+//   - scale-in ladder while holding: at -2.5% buy another 35% of equity, at
+//     -3.5% another 25% (each step once per position), taking the position
+//     to ~100% of equity on a deep dip
 // Exit (whole position):
 //   - retracement: the position's value reaches cost + 40% of the gap between its
 //     cost and its value at the reference price (the close 90 bars before entry)
 //   - stop-loss: the position's value falls to 98.5% of its cost
 //   - time cap: 240 bars after the first entry
 //
-// Sizing is in fractions of equity so the bot scales with its own capital, and
-// the small first tranche keeps the price-impact cost of a false dip low: a
-// full-size round trip costs roughly 40 bps at the pool depths in this window,
-// so a trade has to catch a move well above that to pay. The exit target is a
-// retracement of the drop itself, so the expected move scales with the signal.
+// Sizing is in fractions of equity so the bot scales with its own capital.
+// v2 note: this build is the aggressive variant Scott asked for — the race
+// pays only the top net PnLs, so a timid mid-pack finish earns nothing. The
+// first tranche is up from v1's 25% to 40% and a third tranche was added at
+// -3.5%, so the bot commits earlier and keeps buying the deepest part of a
+// dip; the exit target is a retracement of the drop itself, so the expected
+// move scales with the signal. A full-size round trip costs roughly 40 bps
+// at the pool depths in this window, so a trade has to catch a move well
+// above that to pay.
 //
 // Everything is deterministic: float64 log ratios of the closes the harness sent,
 // no clock, no environment, no randomness.
@@ -33,20 +38,38 @@ const SYMBOL = 'CBBTC';
 /** Lookback, in bars, for the drop that triggers an entry. */
 const LOOKBACK = 90;
 /** 90-bar log return at or below which the first tranche is bought.
- *  -1.5%: the -1.2% variant graded after this one earned less (+$18.13 vs
- *  +$21.57) for one extra roughly breakeven round trip, so the deeper
- *  threshold stays: the deep -2.5% scale-in does the heavy lifting either
- *  way, and the first tranche's job is to be cheap insurance while the
- *  position waits for it. */
+ *  -1.5% stays from v1: the -1.2% variant fires more often but earns less
+ *  (+$18.13 vs +$21.57 in v1's sizing, and the same ordering in v2's grid),
+ *  because the extra entries are the shallow dips whose retracements barely
+ *  clear the ~40 bps round-trip cost. The aggression in v2 is in the size,
+ *  not in a shallower trigger. */
 const DIP1 = -0.015;
-/** Fraction of equity for the first tranche. */
-const SIZE1_NUM = 1n;
-const SIZE1_DEN = 4n;
+/** Fraction of equity for the first tranche. v2 pass 2 (the shipped split):
+ *  40% up front, then a two-step ladder below. Pass 1 put 50% up front with
+ *  an all-in scale-in and graded +$14.30; the ladder below graded higher in
+ *  the offline grid (+$14.93) with a lower drawdown (1.30%), because it keeps
+ *  a third tranche in reserve for the deepest part of the dip instead of
+ *  committing everything by -2.5%. The grid's ordering is monotone and
+ *  structural: 25% up front (v1) +$21.57, 40% +$14.93, 50% +$14.30, 60%
+ *  +$11.66, 75% +$4.92, 100% -$11.97 — every extra unit in the first tranche
+ *  enlarges the stop-outs, while the winners are made by the tranches that
+ *  buy nearer the bottom. 40% is the largest first tranche whose grade
+ *  stays within a third of v1's, and the ladder still takes the position to
+ *  ~100% of equity on a deep dip. */
+const SIZE1_NUM = 2n;
+const SIZE1_DEN = 5n;
 /** 90-bar log return at or below which the scale-in fires while holding. */
 const DIP2 = -0.025;
-/** Fraction of equity for the scale-in. */
-const SIZE2_NUM = 3n;
-const SIZE2_DEN = 4n;
+/** Fraction of equity for the first scale-in. */
+const SIZE2_NUM = 7n;
+const SIZE2_DEN = 20n;
+/** 90-bar log return at or below which the second scale-in fires. */
+const DIP3 = -0.035;
+/** Fraction of equity for the second scale-in; with the tranches above it
+ *  takes the position to ~100% of equity on a deep dip (spends are capped
+ *  at cash on hand, so the last tranche takes whatever is left). */
+const SIZE3_NUM = 1n;
+const SIZE3_DEN = 4n;
 /** Exit when the position has retraced this share of the drop. */
 const RETRACE_NUM = 2n;
 const RETRACE_DEN = 5n;
@@ -64,8 +87,8 @@ const closes: number[] = [];
 let entrySeq = -1;
 /** The close LOOKBACK bars before the first entry of the current position. */
 let refClose = 0;
-/** Whether the scale-in has fired for the current position. */
-let scaledIn = false;
+/** How many scale-ins have fired for the current position (0, 1 or 2). */
+let scaleLevel = 0;
 
 await runBars({
   onBatch(state: BarsState) {
@@ -100,10 +123,14 @@ await runBars({
         orders.push({ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
         return orders;
       }
-      // Scale-in on a deeper drop, once per position.
-      if (!scaledIn && drop <= DIP2) {
-        scaledIn = true;
-        const amount = (state.equity * SIZE2_NUM) / SIZE2_DEN;
+      // Scale-in ladder on deeper drops: +35% of equity at -2.5%, then
+      // +25% at -3.5%, each step once per position.
+      const stepDip = scaleLevel === 0 ? DIP2 : scaleLevel === 1 ? DIP3 : null;
+      if (stepDip !== null && drop <= stepDip) {
+        const num = scaleLevel === 0 ? SIZE2_NUM : SIZE3_NUM;
+        const den = scaleLevel === 0 ? SIZE2_DEN : SIZE3_DEN;
+        scaleLevel += 1;
+        const amount = (state.equity * num) / den;
         const spend = amount < state.cash ? amount : state.cash;
         if (spend >= 1_000_000n) {
           orders.push({ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: MAX_SLIPPAGE_BPS });
@@ -116,7 +143,7 @@ await runBars({
     if (drop <= DIP1) {
       entrySeq = state.seq;
       refClose = ref;
-      scaledIn = false;
+      scaleLevel = 0;
       const amount = (state.equity * SIZE1_NUM) / SIZE1_DEN;
       const spend = amount < state.cash ? amount : state.cash;
       if (spend >= 1_000_000n) {
